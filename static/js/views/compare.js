@@ -1,4 +1,6 @@
-/* 视图 8：结果对比（原图/处理图 + 滑块 + 像素差异）。 */
+/* 视图 8：结果对比（原图/处理图 + 滑块 + 像素差异）。
+   差异热力图是「对比记录」，与处理结果分开管理：
+   不进结果下拉、不能再当输入，只在下方「对比记录」里展示来源并可单独删除。 */
 window.Views = window.Views || {};
 window.Views.compare = (function () {
   const C = window.Common;
@@ -19,6 +21,10 @@ window.Views.compare = (function () {
               <button class="btn" id="cp-diff">生成差异热力图</button>
               <div id="cp-metrics" class="keypoint-stats" style="margin-top:10px"><span class="dim">尚未分析</span></div>
               <div class="stage" id="cp-diff-stage" style="margin-top:10px"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-title">对比记录<span class="dim">差异图仅在此展示，不进入处理结果列表</span></div>
+              <div id="cp-diff-list" style="max-height:280px;overflow:auto"><span class="dim">加载中…</span></div>
             </div>
           </div>
           <div class="col">
@@ -41,6 +47,7 @@ window.Views.compare = (function () {
 
       el.querySelector("#cp-refresh").onclick = () => loadResults(el);
       loadResults(el);
+      loadDiffs(el);
 
       el.querySelector("#cp-result").onchange = () => { resultId = el.querySelector("#cp-result").value; updateCompare(el); };
 
@@ -50,24 +57,67 @@ window.Views.compare = (function () {
         box.innerHTML = `<div class="loading">计算差异…</div>`;
         const r = await Api.post("/api/compare/diff", { image_id: imgId, result_id: resultId });
         box.innerHTML = `<img src="${r.file_url}?t=${Date.now()}">`;
-        const m = r.metrics;
-        el.querySelector("#cp-metrics").innerHTML = `
-          <div>MSE：<strong>${m.mse}</strong></div>
-          <div>RMSE：<strong>${m.rmse}</strong></div>
-          <div>PSNR：<strong>${m.psnr} dB</strong></div>
-          <div>变化像素占比：<strong>${(m.changed_ratio * 100).toFixed(2)}%</strong></div>`;
+        showMetrics(el, r.metrics);
+        loadDiffs(el);
       };
+
+      // 对比记录：点击查看 / 删除
+      el.querySelector("#cp-diff-list").addEventListener("click", async (e) => {
+        const item = e.target.closest("[data-diff]");
+        if (!item) return;
+        const id = item.dataset.diff;
+        if (e.target.closest("[data-act=del]")) {
+          await Api.del("/api/compare/diffs/" + id);
+          C.toast("已删除对比记录");
+          loadDiffs(el);
+          return;
+        }
+        if (e.target.closest("[data-act=view]")) {
+          el.querySelector("#cp-diff-stage").innerHTML = `<img src="/api/compare/diffs/${id}/file?t=${Date.now()}">`;
+          try {
+            showMetrics(el, JSON.parse(item.dataset.metrics || "{}"));
+          } catch (_) { /* 指标缺失时保持原样 */ }
+        }
+      });
 
       bindSlider(el);
     },
 
-    refresh() { const el = document.querySelector('.view[data-view="compare"]'); if (el && this.mounted) loadResults(el); },
+    refresh() { const el = document.querySelector('.view[data-view="compare"]'); if (el && this.mounted) { loadResults(el); loadDiffs(el); } },
   };
 
   async function loadResults(el) {
     const r = await Api.get("/api/results");
     el.querySelector("#cp-result").innerHTML = `<option value="">— 选择结果 —</option>` +
-      r.results.map((x) => `<option value="${x.result_id}">${C.fmtDate(x.created_at)} · ${x.width}×${x.height}</option>`).join("");
+      r.results.map((x) => `<option value="${x.result_id}">${C.fmtDate(x.created_at)} · ${x.width}×${x.height} · #${x.result_id.slice(0, 8)}</option>`).join("");
+  }
+
+  async function loadDiffs(el) {
+    const box = el.querySelector("#cp-diff-list");
+    const r = await Api.get("/api/compare/diffs");
+    if (!r.diffs.length) {
+      box.innerHTML = `<div class="empty" style="padding:16px">暂无对比记录</div>`;
+      return;
+    }
+    box.innerHTML = r.diffs.map((d) => `
+      <div data-diff="${d.diff_id}" data-metrics='${C.esc(JSON.stringify(d.metrics || {}))}'
+           style="display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--border)">
+        <img data-act="view" src="${d.file_url}" title="点击查看"
+             style="width:72px;height:54px;object-fit:cover;border-radius:6px;cursor:pointer;flex:none">
+        <div style="flex:1;min-width:0;font-size:12px">
+          <div>原图：${C.esc(d.image_name)} ｜ 结果：#${(d.result_id || "").slice(0, 8)}${d.result_exists ? "" : "（已删除）"}</div>
+          <div class="dim">MSE ${d.metrics && d.metrics.mse != null ? d.metrics.mse : "-"} · PSNR ${d.metrics && d.metrics.psnr != null ? d.metrics.psnr + " dB" : "-"} · ${C.fmtDate(d.created_at)}</div>
+        </div>
+        <button class="btn btn-sm btn-danger" data-act="del" style="flex:none">删除</button>
+      </div>`).join("");
+  }
+
+  function showMetrics(el, m) {
+    el.querySelector("#cp-metrics").innerHTML = `
+      <div>MSE：<strong>${m.mse}</strong></div>
+      <div>RMSE：<strong>${m.rmse}</strong></div>
+      <div>PSNR：<strong>${m.psnr} dB</strong></div>
+      <div>变化像素占比：<strong>${(m.changed_ratio * 100).toFixed(2)}%</strong></div>`;
   }
 
   async function updateCompare(el) {

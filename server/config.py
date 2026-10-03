@@ -13,6 +13,7 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 
 IMAGES_DIR = os.path.join(DATA_DIR, "images")        # 上传的原图（按内容哈希命名）
 RESULTS_DIR = os.path.join(DATA_DIR, "results")      # 处理结果图
+DIFFS_DIR = os.path.join(DATA_DIR, "diffs")          # 差异对比热力图（与处理结果隔离）
 THUMBS_DIR = os.path.join(DATA_DIR, "thumbnails")    # 预览缩略图
 CACHE_DIR = os.path.join(DATA_DIR, "cache")          # 结果缓存（与 results 统一）
 META_DIR = os.path.join(DATA_DIR, "metadata")        # JSON 元数据
@@ -23,6 +24,7 @@ HISTORY_JSON = os.path.join(META_DIR, "history.json")
 PRESETS_JSON = os.path.join(META_DIR, "presets.json")
 QUEUE_JSON = os.path.join(META_DIR, "queue.json")
 CACHE_JSON = os.path.join(META_DIR, "cache.json")
+DIFFS_JSON = os.path.join(META_DIR, "diffs.json")
 
 # ---------------------------------------------------------------------------
 # 限制与默认值
@@ -47,7 +49,7 @@ ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tiff", ".webp"}
 # 目录
 # ---------------------------------------------------------------------------
 _ALL_DIRS = [
-    DATA_DIR, IMAGES_DIR, RESULTS_DIR, THUMBS_DIR, CACHE_DIR, META_DIR,
+    DATA_DIR, IMAGES_DIR, RESULTS_DIR, DIFFS_DIR, THUMBS_DIR, CACHE_DIR, META_DIR,
 ]
 
 

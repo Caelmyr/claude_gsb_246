@@ -13,6 +13,7 @@ from . import config, pipeline as pipeline_engine
 from .algorithms import detection, features, segmentation, style, util
 from .batch import BatchManager, process_image
 from .cache import ResultCache, make_key
+from .diffs import DiffStore
 from .history import HistoryManager
 from .image_store import ImageStore
 from .nodes import CATEGORIES, get_public_nodes
@@ -25,6 +26,7 @@ from . import storage as storage_mod
 config.ensure_dirs()
 image_store = ImageStore()
 cache = ResultCache()
+diff_store = DiffStore()
 history = HistoryManager()
 batch = BatchManager(image_store, cache, history)
 presets_store = JsonStore(config.PRESETS_JSON, [])
@@ -192,6 +194,7 @@ def patch_image(image_id):
 def delete_image(image_id):
     if not image_store.delete(image_id):
         return jsonify({"error": "not found"}), 404
+    diff_store.delete_for_image(image_id)   # 级联清理依附该原图的差异图
     return jsonify({"ok": True})
 
 
@@ -449,6 +452,11 @@ def run_style():
 
 # ---------------------------------------------------------------------------
 # 对比 / 差异
+#
+# 差异热力图不是处理结果：单独存 DiffStore（data/diffs/ + diffs.json），
+# 带完整来源（原图 + 结果 + 指标），只在对比页展示。
+# 它不进 ResultCache，因此 /api/results 与「选择处理结果」列表永远不含差异图，
+# 差异图也无法作为 result_id 再次参与对比（cache 里查不到 -> 404）。
 # ---------------------------------------------------------------------------
 @bp.post("/compare/diff")
 def compare_diff():
@@ -470,16 +478,57 @@ def compare_diff():
     psnr = 100.0 if mse < 1e-9 else 20 * math.log10(255.0 / max(rmse, 1e-6))
     changed = sum(c for i, c in enumerate(hist) if i > 8) / max(total, 1)
 
-    # 热力图：差异放大 + 伪彩色
+    metrics = {"mse": round(mse, 2), "rmse": round(rmse, 2),
+               "psnr": round(psnr, 2), "changed_ratio": round(changed, 4)}
+
+    # 热力图：差异放大 + 伪彩色，存入独立的差异图存储（带来源）
     heat = diff.point(lambda v: util.clamp(v * 4))
     heat_rgb = colorize_heat(heat)
-    result_id = cache.put(make_key(rec["hash"], result_id, "diff"), heat_rgb)
+    diff_id = diff_store.put(rec["id"], result_id, heat_rgb, metrics)
     return jsonify({
-        "result_id": result_id,
-        "file_url": f"/api/results/{result_id}/file",
-        "metrics": {"mse": round(mse, 2), "rmse": round(rmse, 2),
-                    "psnr": round(psnr, 2), "changed_ratio": round(changed, 4)},
+        "diff_id": diff_id,
+        "file_url": f"/api/compare/diffs/{diff_id}/file",
+        "metrics": metrics,
     })
+
+
+def _diff_view(entry):
+    """差异对比记录视图：附带来源信息，方便前端标明出自哪次对比。"""
+    img = image_store.get(entry.get("image_id"))
+    result = cache.get_entry(entry.get("result_id"))
+    return {
+        "diff_id": entry.get("diff_id"),
+        "image_id": entry.get("image_id"),
+        "image_name": (img or {}).get("filename") or "（原图已删除）",
+        "result_id": entry.get("result_id"),
+        "result_exists": result is not None,
+        "result_created_at": (result or {}).get("created_at"),
+        "metrics": entry.get("metrics", {}),
+        "width": entry.get("width"),
+        "height": entry.get("height"),
+        "created_at": entry.get("created_at"),
+        "file_url": f"/api/compare/diffs/{entry.get('diff_id')}/file",
+    }
+
+
+@bp.get("/compare/diffs")
+def list_diffs():
+    return jsonify({"diffs": [_diff_view(e) for e in diff_store.list()]})
+
+
+@bp.get("/compare/diffs/<diff_id>/file")
+def diff_file(diff_id):
+    path = diff_store.file_path(diff_id)
+    if not path:
+        return jsonify({"error": "not found"}), 404
+    return send_file(path, mimetype="image/png")
+
+
+@bp.delete("/compare/diffs/<diff_id>")
+def delete_diff(diff_id):
+    if not diff_store.delete(diff_id):
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True})
 
 
 def colorize_heat(gray):
@@ -619,6 +668,7 @@ def delete_history(history_id):
     e = history.get(history_id)
     if e and e.get("result_id"):
         cache.delete_result(e["result_id"])
+        diff_store.delete_for_result(e["result_id"])   # 级联清理依附该结果的差异图
     history.delete(history_id)
     return jsonify({"ok": True})
 
@@ -642,9 +692,56 @@ def restore_history(history_id):
     return jsonify(_pipeline_view(rec))
 
 
+def _migrate_legacy_diffs(app=None):
+    """把旧版本混进结果缓存的差异热力图迁移到 DiffStore。
+
+    旧实现的差异图以 make_key(图像哈希, result_id, "diff") 为键存在 cache.json，
+    与正式结果同表同目录，无法区分也无法单独清理。这里按原公式精确反查，
+    把文件搬进 data/diffs/、来源登记进 diffs.json，再从结果缓存中删除。
+    """
+    import os
+    doc = cache.store.read()
+    if not doc:
+        return 0
+    result_ids = [e.get("result_id") for e in doc.values()]
+    moved = 0
+    for rec in image_store.list_records():
+        for rid in result_ids:
+            legacy_key = make_key(rec["hash"], rid, "diff")
+            entry = doc.get(legacy_key)
+            if not entry:
+                continue
+            # 文件搬家：results/ -> diffs/
+            src = os.path.join(config.RESULTS_DIR, entry.get("file", ""))
+            if os.path.exists(src):
+                dest_name = entry["result_id"] + ".png"
+                os.replace(src, os.path.join(config.DIFFS_DIR, dest_name))
+                size = os.path.getsize(os.path.join(config.DIFFS_DIR, dest_name))
+            else:
+                dest_name, size = "", 0
+            diff_store.register({
+                "diff_id": entry["result_id"],
+                "image_id": rec["id"],
+                "result_id": rid,
+                "metrics": entry.get("meta", {}) or {},
+                "file": dest_name,
+                "size_bytes": size,
+                "width": entry.get("width"),
+                "height": entry.get("height"),
+                "created_at": entry.get("created_at") or now_iso(),
+            })
+            cache.delete_result(entry["result_id"])
+            doc.pop(legacy_key, None)
+            moved += 1
+    if moved and app:
+        app.logger.info("已迁移 %d 张旧差异热力图到独立存储", moved)
+    return moved
+
+
 def init_app(app):
     """在应用启动时注册蓝图并做一次性一致性检查。"""
     app.register_blueprint(bp)
+    _migrate_legacy_diffs(app)
     issues = image_store.reconcile()
     if issues["orphan_files"] or issues["orphan_meta"]:
         app.logger.info("启动一致性检查发现孤儿：%s", issues)
