@@ -5,6 +5,7 @@
 """
 import io
 import json
+import os
 
 from flask import Blueprint, jsonify, request, send_file
 from PIL import Image, ImageChops
@@ -13,6 +14,7 @@ from . import config, pipeline as pipeline_engine
 from .algorithms import detection, features, segmentation, style, util
 from .batch import BatchManager, process_image
 from .cache import ResultCache, make_key
+from .diff_store import DiffStore
 from .history import HistoryManager
 from .image_store import ImageStore
 from .nodes import CATEGORIES, get_public_nodes
@@ -26,6 +28,7 @@ config.ensure_dirs()
 image_store = ImageStore()
 cache = ResultCache()
 history = HistoryManager()
+diff_store = DiffStore()
 batch = BatchManager(image_store, cache, history)
 presets_store = JsonStore(config.PRESETS_JSON, [])
 
@@ -192,6 +195,7 @@ def patch_image(image_id):
 def delete_image(image_id):
     if not image_store.delete(image_id):
         return jsonify({"error": "not found"}), 404
+    diff_store.delete_for_image(image_id)  # 级联清理该图参与生成的差异对比图
     return jsonify({"ok": True})
 
 
@@ -448,8 +452,31 @@ def run_style():
 
 
 # ---------------------------------------------------------------------------
-# 对比 / 差异
+# 对比 / 差异（差异图由 DiffStore 独立管理，不进入处理结果列表）
 # ---------------------------------------------------------------------------
+def _diff_view(rec):
+    """给前端用的对比记录视图：解析来源（原图 / 结果）并标注是否已失效。"""
+    img = image_store.get(rec.get("image_id"))
+    src = cache.get_entry(rec.get("result_id"))
+    if src:
+        result_label = f"{src.get('created_at', '')} · {src.get('width')}×{src.get('height')}"
+    else:
+        result_label = "（源结果已删除）"
+    return {
+        "id": rec.get("id"),
+        "image_id": rec.get("image_id"),
+        "result_id": rec.get("result_id"),
+        "image_name": (img or {}).get("filename") or rec.get("image_name") or "（原图已删除）",
+        "image_deleted": img is None,
+        "result_label": result_label,
+        "result_deleted": src is None,
+        "metrics": rec.get("metrics", {}),
+        "created_at": rec.get("created_at"),
+        "updated_at": rec.get("updated_at"),
+        "file_url": f"/api/compare/diffs/{rec.get('id')}/file",
+    }
+
+
 @bp.post("/compare/diff")
 def compare_diff():
     data = request.get_json(silent=True) or {}
@@ -457,6 +484,7 @@ def compare_diff():
     result_id = data.get("result_id")
     img_b = cache.result_image(result_id)
     if not rec or img_b is None:
+        # 差异图的 id 不在结果缓存中，天然无法被当作输入继续对比
         return jsonify({"error": "图像或结果不存在"}), 404
 
     # 对齐到同一尺寸（以结果尺寸为准）
@@ -473,13 +501,31 @@ def compare_diff():
     # 热力图：差异放大 + 伪彩色
     heat = diff.point(lambda v: util.clamp(v * 4))
     heat_rgb = colorize_heat(heat)
-    result_id = cache.put(make_key(rec["hash"], result_id, "diff"), heat_rgb)
-    return jsonify({
-        "result_id": result_id,
-        "file_url": f"/api/results/{result_id}/file",
-        "metrics": {"mse": round(mse, 2), "rmse": round(rmse, 2),
-                    "psnr": round(psnr, 2), "changed_ratio": round(changed, 4)},
-    })
+    metrics = {"mse": round(mse, 2), "rmse": round(rmse, 2),
+               "psnr": round(psnr, 2), "changed_ratio": round(changed, 4)}
+    diff_rec = diff_store.put(rec["id"], result_id, heat_rgb, metrics,
+                              image_name=rec.get("filename", ""))
+    return jsonify({**_diff_view(diff_rec), "diff_id": diff_rec["id"]})
+
+
+@bp.get("/compare/diffs")
+def list_diffs():
+    return jsonify({"diffs": [_diff_view(r) for r in diff_store.list()]})
+
+
+@bp.get("/compare/diffs/<diff_id>/file")
+def diff_file(diff_id):
+    path = diff_store.file_path(diff_id)
+    if not path:
+        return jsonify({"error": "not found"}), 404
+    return send_file(path, mimetype="image/png")
+
+
+@bp.delete("/compare/diffs/<diff_id>")
+def delete_diff(diff_id):
+    if not diff_store.delete(diff_id):
+        return jsonify({"error": "not found"}), 404
+    return jsonify({"ok": True})
 
 
 def colorize_heat(gray):
@@ -619,6 +665,7 @@ def delete_history(history_id):
     e = history.get(history_id)
     if e and e.get("result_id"):
         cache.delete_result(e["result_id"])
+        diff_store.delete_for_result(e["result_id"])  # 级联清理引用该结果的差异图
     history.delete(history_id)
     return jsonify({"ok": True})
 
@@ -642,10 +689,50 @@ def restore_history(history_id):
     return jsonify(_pipeline_view(rec))
 
 
+def _migrate_legacy_diffs():
+    """把旧版本混进结果缓存的差异热力图迁移到 DiffStore。
+
+    旧逻辑用 make_key(图像哈希, 结果id, "diff") 作为缓存键把差异图写进结果
+    缓存，与真正的处理结果混在一起。这里按同一规则反查识别：命中即把文件
+    搬入 data/diffs/ 并登记来源（图像 × 结果），再从结果缓存中移除。
+    """
+    entries = cache.store.read()
+    if not entries:
+        return 0
+    result_ids = {e.get("result_id") for e in entries.values()}
+    images = image_store.list_records()
+
+    # 预计算所有可能的旧差异键 -> (image_id, result_id)
+    legacy_keys = {}
+    for rec in images:
+        for rid in result_ids:
+            legacy_keys[make_key(rec["hash"], rid, "diff")] = (rec["id"], rid)
+
+    moved = 0
+    for key, entry in entries.items():
+        pair = legacy_keys.get(key)
+        if not pair:
+            continue
+        image_id, source_result = pair
+        src = os.path.join(config.RESULTS_DIR, entry.get("file", ""))
+        if os.path.exists(src):
+            diff_store.adopt(image_id, source_result, src,
+                             image_name=(image_store.get(image_id) or {}).get("filename", ""),
+                             created_at=entry.get("created_at"))
+        # 无论文件是否还在，都要把这条记录移出结果缓存
+        cache.delete_result(entry.get("result_id"))
+        moved += 1
+    return moved
+
+
 def init_app(app):
     """在应用启动时注册蓝图并做一次性一致性检查。"""
     app.register_blueprint(bp)
     issues = image_store.reconcile()
     if issues["orphan_files"] or issues["orphan_meta"]:
         app.logger.info("启动一致性检查发现孤儿：%s", issues)
+    moved = _migrate_legacy_diffs()
+    if moved:
+        app.logger.info("已把 %d 张旧差异热力图从结果缓存迁移到对比记录", moved)
+    diff_store.reconcile()
     return app

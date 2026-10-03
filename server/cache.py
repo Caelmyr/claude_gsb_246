@@ -78,13 +78,18 @@ class ResultCache:
             return None
 
     def list_results(self):
-        """按创建时间倒序返回结果条目列表。"""
-        entries = list(self.store.read().values())
+        """按创建时间倒序返回处理结果条目列表。
+
+        差异对比图不属于处理结果（由 DiffStore 单独管理），这里防御性地
+        过滤掉 kind=diff 的条目，保证结果列表永远不会混入差异图。
+        """
+        entries = [e for e in self.store.read().values()
+                   if e.get("kind", "process") != "diff"]
         entries.sort(key=lambda e: e.get("created_at", ""), reverse=True)
         return entries
 
     # ------------------------------------------------------------------ 写
-    def put(self, key, image, meta=None):
+    def put(self, key, image, meta=None, kind="process"):
         """保存结果图并登记缓存，返回 result_id。"""
         result_id = uuid.uuid4().hex
         file_name = result_id + ".png"
@@ -99,6 +104,7 @@ class ResultCache:
         entry = {
             "result_id": result_id,
             "key": key,
+            "kind": kind,
             "file": file_name,
             "size_bytes": os.path.getsize(dest),
             "width": rgb.size[0],
